@@ -1,4 +1,4 @@
-"""Mem0 MCP server package."""
+"""Mem0 MCP server package (local mode)."""
 
 from .server import main
 

@@ -1,35 +1,29 @@
-"""MCP server that exposes Mem0 REST endpoints as MCP tools."""
+"""MCP server that exposes Mem0 local memory as MCP tools."""
 
 from __future__ import annotations
 
 import json
 import logging
 import os
-from typing import Annotated, Any, Callable, Dict, Optional, TypeVar
+from typing import Annotated, Any, Dict, Optional
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import Context, FastMCP
-from mcp.server.transport_security import TransportSecuritySettings
-from mem0 import MemoryClient
-from mem0.exceptions import MemoryError
+from mem0 import Memory
 from pydantic import Field
 
-try:  # Support both package (`python -m mem0_mcp.server`) and script (`python mem0_mcp/server.py`) runs.
+try:
     from .schemas import (
         AddMemoryArgs,
-        ConfigSchema,
         DeleteAllArgs,
-        DeleteEntitiesArgs,
         GetMemoriesArgs,
         SearchMemoriesArgs,
         ToolMessage,
     )
-except ImportError:  # pragma: no cover - fallback for script execution
+except ImportError:
     from schemas import (
         AddMemoryArgs,
-        ConfigSchema,
         DeleteAllArgs,
-        DeleteEntitiesArgs,
         GetMemoriesArgs,
         SearchMemoriesArgs,
         ToolMessage,
@@ -37,143 +31,108 @@ except ImportError:  # pragma: no cover - fallback for script execution
 
 load_dotenv()
 
+os.environ["MEM0_TELEMETRY"] = os.getenv("MEM0_TELEMETRY", "false")
+
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s | %(message)s")
 logger = logging.getLogger("mem0_mcp_server")
 
+ENV_DEFAULT_USER_ID = os.getenv("MEM0_DEFAULT_USER_ID", "default")
 
+# Data directory
+_DATA_DIR = os.getenv("MEM0_DATA_DIR", os.path.expanduser("~/.local/share/mem0"))
 
-
-T = TypeVar("T")
-
-try:
-    from smithery.decorators import smithery
-except ImportError:  # pragma: no cover - Smithery optional
-
-    class _SmitheryFallback:
-        @staticmethod
-        def server(*args, **kwargs):  # type: ignore[misc]
-            def decorator(func: Callable[..., T]) -> Callable[..., T]:  # type: ignore[type-var]
-                return func
-
-            return decorator
-
-    smithery = _SmitheryFallback()  # type: ignore[assignment]
-
-
-# graph remains off by default , also set the default user_id to "mem0-mcp" when nothing set
-ENV_API_KEY = os.getenv("MEM0_API_KEY")
-ENV_DEFAULT_USER_ID = os.getenv("MEM0_DEFAULT_USER_ID", "mem0-mcp")
-ENV_ENABLE_GRAPH_DEFAULT = os.getenv("MEM0_ENABLE_GRAPH_DEFAULT", "false").lower() in {
-    "1",
-    "true",
-    "yes",
+# Embedding model dims lookup for common models
+_KNOWN_DIMS = {
+    "multi-qa-MiniLM-L6-cos-v1": 384,
+    "all-MiniLM-L6-v2": 384,
+    "BAAI/bge-small-en-v1.5": 384,
+    "BAAI/bge-base-en-v1.5": 768,
+    "nomic-ai/nomic-embed-text-v1.5": 768,
 }
 
-_CLIENT_CACHE: Dict[str, MemoryClient] = {}
 
+def _build_config() -> dict:
+    """Build mem0 Memory config from environment variables."""
+    embedder_model = os.getenv("MEM0_EMBEDDER_MODEL", "multi-qa-MiniLM-L6-cos-v1")
+    embedding_dims = int(
+        os.getenv("MEM0_EMBEDDING_DIMS", str(_KNOWN_DIMS.get(embedder_model, 384)))
+    )
 
-def _config_value(source: Any, field: str):
-    if source is None:
-        return None
-    if isinstance(source, dict):
-        return source.get(field)
-    return getattr(source, field, None)
+    config: dict[str, Any] = {
+        "llm": {
+            "provider": os.getenv("MEM0_LLM_PROVIDER", "openai"),
+            "config": {
+                "model": os.getenv("MEM0_LLM_MODEL", "local-model"),
+                "openai_base_url": os.getenv("MEM0_LLM_BASE_URL", "http://localhost:8080/v1"),
+                "api_key": os.getenv("MEM0_LLM_API_KEY", "not-needed"),
+                "temperature": float(os.getenv("MEM0_LLM_TEMPERATURE", "0.1")),
+                "max_tokens": int(os.getenv("MEM0_LLM_MAX_TOKENS", "2000")),
+            },
+        },
+        "embedder": {
+            "provider": os.getenv("MEM0_EMBEDDER_PROVIDER", "huggingface"),
+            "config": {
+                "model": embedder_model,
+            },
+        },
+        "vector_store": {
+            "provider": os.getenv("MEM0_VECTOR_STORE", "qdrant"),
+            "config": {
+                "collection_name": os.getenv("MEM0_COLLECTION", "mem0"),
+                "path": os.getenv("MEM0_QDRANT_PATH", os.path.join(_DATA_DIR, "qdrant")),
+                "embedding_model_dims": embedding_dims,
+            },
+        },
+        "history_db_path": os.getenv(
+            "MEM0_HISTORY_DB", os.path.join(_DATA_DIR, "history.db")
+        ),
+    }
 
-
-def _with_default_filters(
-    default_user_id: str, filters: Optional[Dict[str, Any]] = None
-) -> Dict[str, Any]:
-    """Ensure filters exist and include the default user_id at the top level."""
-    if not filters:
-        return {"AND": [{"user_id": default_user_id}]}
-    if not any(key in filters for key in ("AND", "OR", "NOT")):
-        filters = {"AND": [filters]}
-    has_user = json.dumps(filters, sort_keys=True).find('"user_id"') != -1
-    if not has_user:
-        and_list = filters.setdefault("AND", [])
-        if not isinstance(and_list, list):
-            raise ValueError("filters['AND'] must be a list when present.")
-        and_list.insert(0, {"user_id": default_user_id})
-    return filters
+    return config
 
 
 def _mem0_call(func, *args, **kwargs):
+    """Call a mem0 function and return JSON, catching errors."""
     try:
         result = func(*args, **kwargs)
-    except MemoryError as exc:  # surface structured error back to MCP client
+    except Exception as exc:
         logger.error("Mem0 call failed: %s", exc)
-        # returns the erorr to the model
-        return json.dumps(
-            {
-                "error": str(exc),
-                "status": getattr(exc, "status", None),
-                "payload": getattr(exc, "payload", None),
-            },
-            ensure_ascii=False,
-        )
-    return json.dumps(result, ensure_ascii=False)
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+    return json.dumps(result, ensure_ascii=False, default=str)
 
 
-def _resolve_settings(ctx: Context | None) -> tuple[str, str, bool]:
-    session_config = getattr(ctx, "session_config", None)
-    api_key = _config_value(session_config, "mem0_api_key") or ENV_API_KEY
-    if not api_key:
-        raise RuntimeError(
-            "MEM0_API_KEY is required (via Smithery config, session config, or environment) to run the Mem0 MCP server."
-        )
-
-    default_user = _config_value(session_config, "default_user_id") or ENV_DEFAULT_USER_ID
-    enable_graph_default = _config_value(session_config, "enable_graph_default")
-    if enable_graph_default is None:
-        enable_graph_default = ENV_ENABLE_GRAPH_DEFAULT
-
-    return api_key, default_user, enable_graph_default
+_MEMORY_INSTANCE: Optional[Memory] = None
 
 
-# init the client
-def _mem0_client(api_key: str) -> MemoryClient:
-    client = _CLIENT_CACHE.get(api_key)
-    if client is None:
-        client = MemoryClient(api_key=api_key)
-        _CLIENT_CACHE[api_key] = client
-    return client
+def _get_memory() -> Memory:
+    """Lazily initialize the Memory instance."""
+    global _MEMORY_INSTANCE
+    if _MEMORY_INSTANCE is None:
+        config = _build_config()
+        logger.info("Initializing mem0 Memory with config: %s", json.dumps(config, indent=2))
+        os.makedirs(config["vector_store"]["config"]["path"], exist_ok=True)
+        os.makedirs(os.path.dirname(config["history_db_path"]), exist_ok=True)
+        _MEMORY_INSTANCE = Memory.from_config(config)
+    return _MEMORY_INSTANCE
 
 
-def _default_enable_graph(enable_graph: Optional[bool], default: bool) -> bool:
-    if enable_graph is None:
-        return default
-    return enable_graph
-
-
-@smithery.server(config_schema=ConfigSchema)
 def create_server() -> FastMCP:
-    """Create a FastMCP server usable via stdio, Docker, or Smithery."""
-
-    # When running inside Smithery, the platform probes the server without user-provided
-    # session config, so we defer the hard requirement for MEM0_API_KEY until a tool call.
-    if not ENV_API_KEY:
-        logger.warning(
-            "MEM0_API_KEY is not set; Smithery health checks will pass, but every tool "
-            "invocation will fail until a key is supplied via session config or env vars."
-        )
+    """Create a FastMCP server with local mem0 tools."""
 
     server = FastMCP(
         "mem0",
         host=os.getenv("HOST", "0.0.0.0"),
         port=int(os.getenv("PORT", "8081")),
-        transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
 
-    # graph is disabled by default to make queries simpler and fast
-    # Mention " Enable/Use graph while calling memory " in your system prompt to run it in each instance
-
-    @server.tool(description="Store a new preference, fact, or conversation snippet. Requires at least one: user_id, agent_id, or run_id.")
+    @server.tool(
+        description="Store a new preference, fact, or conversation snippet. "
+        "Requires at least one: user_id, agent_id, or run_id."
+    )
     def add_memory(
         text: Annotated[
             str,
-            Field(
-                description="Plain sentence summarizing what to store. Required even if `messages` is provided."
-            ),
+            Field(description="Plain sentence summarizing what to store."),
         ],
         messages: Annotated[
             Optional[list[Dict[str, str]]],
@@ -185,300 +144,239 @@ def create_server() -> FastMCP:
         ] = None,
         user_id: Annotated[
             Optional[str],
-            Field(default=None, description="Override the default user scope for this write."),
+            Field(default=None, description="Override the default user scope."),
         ] = None,
         agent_id: Annotated[
-            Optional[str], Field(default=None, description="Optional agent identifier.")
-        ] = None,
-        app_id: Annotated[
-            Optional[str], Field(default=None, description="Optional app identifier.")
+            Optional[str],
+            Field(default=None, description="Optional agent identifier."),
         ] = None,
         run_id: Annotated[
-            Optional[str], Field(default=None, description="Optional run identifier.")
+            Optional[str],
+            Field(default=None, description="Optional run identifier."),
         ] = None,
         metadata: Annotated[
             Optional[Dict[str, Any]],
-            Field(default=None, description="Attach arbitrary metadata JSON to the memory."),
-        ] = None,
-        enable_graph: Annotated[
-            Optional[bool],
-            Field(
-                default=None,
-                description="Set true only if the caller explicitly wants Mem0 graph memory.",
-            ),
+            Field(default=None, description="Attach arbitrary metadata JSON."),
         ] = None,
         ctx: Context | None = None,
     ) -> str:
-        """Write durable information to Mem0."""
+        """Write durable information to mem0."""
+        memory = _get_memory()
+        uid = user_id or (ENV_DEFAULT_USER_ID if not (agent_id or run_id) else None)
 
-        api_key, default_user, graph_default = _resolve_settings(ctx)
         args = AddMemoryArgs(
             text=text,
             messages=[ToolMessage(**msg) for msg in messages] if messages else None,
-            user_id=user_id if user_id else (default_user if not (agent_id or run_id) else None),
+            user_id=uid,
             agent_id=agent_id,
-            app_id=app_id,
             run_id=run_id,
             metadata=metadata,
-            enable_graph=_default_enable_graph(enable_graph, graph_default),
         )
-        payload = args.model_dump(exclude_none=True)
-        payload.setdefault("enable_graph", graph_default)
-        conversation = payload.pop("messages", None)
+
+        # Build conversation payload
+        conversation = (
+            [m.model_dump() for m in args.messages] if args.messages else None
+        )
         if not conversation:
-            derived_text = payload.pop("text", None)
-            if derived_text:
-                conversation = [{"role": "user", "content": derived_text}]
+            if args.text:
+                conversation = [{"role": "user", "content": args.text}]
             else:
                 return json.dumps(
                     {
                         "error": "messages_missing",
-                        "detail": "Provide either `text` or `messages` so Mem0 knows what to store.",
+                        "detail": "Provide either `text` or `messages`.",
                     },
                     ensure_ascii=False,
                 )
-        else:
-            payload.pop("text", None)
 
-        client = _mem0_client(api_key)
-        return _mem0_call(client.add, conversation, **payload)
+        kwargs: Dict[str, Any] = {}
+        if args.user_id:
+            kwargs["user_id"] = args.user_id
+        if args.agent_id:
+            kwargs["agent_id"] = args.agent_id
+        if args.run_id:
+            kwargs["run_id"] = args.run_id
+        if args.metadata:
+            kwargs["metadata"] = args.metadata
+
+        return _mem0_call(memory.add, conversation, **kwargs)
 
     @server.tool(
-        description="""Run a semantic search over existing memories.
-
-        Use filters to narrow results. Common filter patterns:
-        - Single user: {"AND": [{"user_id": "john"}]}
-        - Agent memories: {"AND": [{"agent_id": "agent_name"}]}
-        - Recent memories: {"AND": [{"user_id": "john"}, {"created_at": {"gte": "2024-01-01"}}]}
-        - Multiple users: {"AND": [{"user_id": {"in": ["john", "jane"]}}]}
-        - Cross-entity: {"OR": [{"user_id": "john"}, {"agent_id": "agent_name"}]}
-
-        user_id is automatically added to filters if not provided.
-        """
+        description="Run a semantic search over existing memories. "
+        "user_id defaults to the server default if not provided."
     )
     def search_memories(
-        query: Annotated[str, Field(description="Natural language description of what to find.")],
-        filters: Annotated[
-            Optional[Dict[str, Any]],
-            Field(default=None, description="Additional filter clauses (user_id injected automatically)."),
+        query: Annotated[
+            str, Field(description="Natural language description of what to find.")
+        ],
+        user_id: Annotated[
+            Optional[str],
+            Field(default=None, description="User scope for the search."),
+        ] = None,
+        agent_id: Annotated[
+            Optional[str],
+            Field(default=None, description="Agent scope for the search."),
+        ] = None,
+        run_id: Annotated[
+            Optional[str],
+            Field(default=None, description="Run scope for the search."),
         ] = None,
         limit: Annotated[
-            Optional[int], Field(default=None, description="Maximum number of results to return.")
-        ] = None,
-        enable_graph: Annotated[
-            Optional[bool],
-            Field(
-                default=None,
-                description="Set true only when the user explicitly wants graph-derived memories.",
-            ),
+            Optional[int],
+            Field(default=None, description="Maximum number of results."),
         ] = None,
         ctx: Context | None = None,
     ) -> str:
         """Semantic search against existing memories."""
+        memory = _get_memory()
+        uid = user_id or (ENV_DEFAULT_USER_ID if not (agent_id or run_id) else None)
 
-        api_key, default_user, graph_default = _resolve_settings(ctx)
-        args = SearchMemoriesArgs(
-            query=query,
-            filters=filters,
-            limit=limit,
-            enable_graph=_default_enable_graph(enable_graph, graph_default),
-        )
-        payload = args.model_dump(exclude_none=True)
-        payload["filters"] = _with_default_filters(default_user, payload.get("filters"))
-        payload.setdefault("enable_graph", graph_default)
-        client = _mem0_client(api_key)
-        return _mem0_call(client.search, **payload)
+        kwargs: Dict[str, Any] = {"query": query}
+        if uid:
+            kwargs["user_id"] = uid
+        if agent_id:
+            kwargs["agent_id"] = agent_id
+        if run_id:
+            kwargs["run_id"] = run_id
+        if limit:
+            kwargs["limit"] = limit
+
+        return _mem0_call(memory.search, **kwargs)
 
     @server.tool(
-        description="""Page through memories using filters instead of search.
-
-        Use filters to list specific memories. Common filter patterns:
-        - Single user: {"AND": [{"user_id": "john"}]}
-        - Agent memories: {"AND": [{"agent_id": "agent_name"}]}
-        - Recent memories: {"AND": [{"user_id": "john"}, {"created_at": {"gte": "2024-01-01"}}]}
-        - Multiple users: {"AND": [{"user_id": {"in": ["john", "jane"]}}]}
-
-        Pagination: Use page (1-indexed) and page_size for browsing results.
-        user_id is automatically added to filters if not provided.
-        """
+        description="List memories by scope. "
+        "user_id defaults to the server default if not provided."
     )
     def get_memories(
-        filters: Annotated[
-            Optional[Dict[str, Any]],
-            Field(default=None, description="Structured filters; user_id injected automatically."),
+        user_id: Annotated[
+            Optional[str],
+            Field(default=None, description="User scope for listing."),
         ] = None,
-        page: Annotated[
-            Optional[int], Field(default=None, description="1-indexed page number when paginating.")
+        agent_id: Annotated[
+            Optional[str],
+            Field(default=None, description="Agent scope for listing."),
         ] = None,
-        page_size: Annotated[
-            Optional[int], Field(default=None, description="Number of memories per page (default 10).")
+        run_id: Annotated[
+            Optional[str],
+            Field(default=None, description="Run scope for listing."),
         ] = None,
-        enable_graph: Annotated[
-            Optional[bool],
-            Field(
-                default=None,
-                description="Set true only if the caller explicitly wants graph-derived memories.",
-            ),
+        limit: Annotated[
+            Optional[int],
+            Field(default=None, description="Maximum number of memories to return."),
         ] = None,
         ctx: Context | None = None,
     ) -> str:
-        """List memories via structured filters or pagination."""
+        """List memories via scope filters."""
+        memory = _get_memory()
+        uid = user_id or (ENV_DEFAULT_USER_ID if not (agent_id or run_id) else None)
 
-        api_key, default_user, graph_default = _resolve_settings(ctx)
-        args = GetMemoriesArgs(
-            filters=filters,
-            page=page,
-            page_size=page_size,
-            enable_graph=_default_enable_graph(enable_graph, graph_default),
-        )
-        payload = args.model_dump(exclude_none=True)
-        payload["filters"] = _with_default_filters(default_user, payload.get("filters"))
-        payload.setdefault("enable_graph", graph_default)
-        client = _mem0_client(api_key)
-        return _mem0_call(client.get_all, **payload)
+        kwargs: Dict[str, Any] = {}
+        if uid:
+            kwargs["user_id"] = uid
+        if agent_id:
+            kwargs["agent_id"] = agent_id
+        if run_id:
+            kwargs["run_id"] = run_id
+        if limit:
+            kwargs["limit"] = limit
+
+        return _mem0_call(memory.get_all, **kwargs)
+
+    @server.tool(description="Fetch a single memory by its memory_id.")
+    def get_memory(
+        memory_id: Annotated[
+            str, Field(description="Exact memory_id to fetch.")
+        ],
+        ctx: Context | None = None,
+    ) -> str:
+        """Retrieve a single memory by ID."""
+        memory = _get_memory()
+        return _mem0_call(memory.get, memory_id)
+
+    @server.tool(description="Overwrite an existing memory's text.")
+    def update_memory(
+        memory_id: Annotated[
+            str, Field(description="Exact memory_id to overwrite.")
+        ],
+        text: Annotated[
+            str, Field(description="Replacement text for the memory.")
+        ],
+        ctx: Context | None = None,
+    ) -> str:
+        """Overwrite an existing memory's text."""
+        memory = _get_memory()
+        return _mem0_call(memory.update, memory_id=memory_id, data=text)
+
+    @server.tool(description="Delete one memory by its memory_id.")
+    def delete_memory(
+        memory_id: Annotated[
+            str, Field(description="Exact memory_id to delete.")
+        ],
+        ctx: Context | None = None,
+    ) -> str:
+        """Delete a memory by ID."""
+        memory = _get_memory()
+        return _mem0_call(memory.delete, memory_id)
 
     @server.tool(
-        description="Delete every memory in the given user/agent/app/run but keep the entity."
+        description="Delete every memory in the given user/agent/run scope."
     )
     def delete_all_memories(
         user_id: Annotated[
-            Optional[str], Field(default=None, description="User scope to delete; defaults to server user.")
+            Optional[str],
+            Field(default=None, description="User scope to delete; defaults to server user."),
         ] = None,
         agent_id: Annotated[
-            Optional[str], Field(default=None, description="Optional agent scope to delete.")
-        ] = None,
-        app_id: Annotated[
-            Optional[str], Field(default=None, description="Optional app scope to delete.")
+            Optional[str],
+            Field(default=None, description="Optional agent scope to delete."),
         ] = None,
         run_id: Annotated[
-            Optional[str], Field(default=None, description="Optional run scope to delete.")
+            Optional[str],
+            Field(default=None, description="Optional run scope to delete."),
         ] = None,
         ctx: Context | None = None,
     ) -> str:
         """Bulk-delete every memory in the confirmed scope."""
+        memory = _get_memory()
+        uid = user_id or ENV_DEFAULT_USER_ID
 
-        api_key, default_user, _ = _resolve_settings(ctx)
-        args = DeleteAllArgs(
-            user_id=user_id or default_user,
-            agent_id=agent_id,
-            app_id=app_id,
-            run_id=run_id,
-        )
-        payload = args.model_dump(exclude_none=True)
-        client = _mem0_client(api_key)
-        return _mem0_call(client.delete_all, **payload)
+        args = DeleteAllArgs(user_id=uid, agent_id=agent_id, run_id=run_id)
+        kwargs = args.model_dump(exclude_none=True)
+        return _mem0_call(memory.delete_all, **kwargs)
 
-    @server.tool(description="List which users/agents/apps/runs currently hold memories.")
-    def list_entities(ctx: Context | None = None) -> str:
-        """List users/agents/apps/runs with stored memories."""
-
-        api_key, _, _ = _resolve_settings(ctx)
-        client = _mem0_client(api_key)
-        return _mem0_call(client.users)
-
-    @server.tool(description="Fetch a single memory once you know its memory_id.")
-    def get_memory(
-        memory_id: Annotated[str, Field(description="Exact memory_id to fetch.")],
+    @server.tool(description="Get the history of changes for a specific memory.")
+    def memory_history(
+        memory_id: Annotated[
+            str, Field(description="Memory ID to get history for.")
+        ],
         ctx: Context | None = None,
     ) -> str:
-        """Retrieve a single memory once the user has picked an exact ID."""
+        """Get the audit trail for a memory."""
+        memory = _get_memory()
+        return _mem0_call(memory.history, memory_id)
 
-        api_key, _, _ = _resolve_settings(ctx)
-        client = _mem0_client(api_key)
-        return _mem0_call(client.get, memory_id)
-
-    @server.tool(description="Overwrite an existing memory’s text.")
-    def update_memory(
-        memory_id: Annotated[str, Field(description="Exact memory_id to overwrite.")],
-        text: Annotated[str, Field(description="Replacement text for the memory.")],
-        ctx: Context | None = None,
-    ) -> str:
-        """Overwrite an existing memory’s text after the user confirms the exact memory_id."""
-
-        api_key, _, _ = _resolve_settings(ctx)
-        client = _mem0_client(api_key)
-        return _mem0_call(client.update, memory_id=memory_id, text=text)
-
-    @server.tool(description="Delete one memory after the user confirms its memory_id.")
-    def delete_memory(
-        memory_id: Annotated[str, Field(description="Exact memory_id to delete.")],
-        ctx: Context | None = None,
-    ) -> str:
-        """Delete a memory once the user explicitly confirms the memory_id to remove."""
-
-        api_key, _, _ = _resolve_settings(ctx)
-        client = _mem0_client(api_key)
-        return _mem0_call(client.delete, memory_id)
-
-    @server.tool(
-        description="Remove a user/agent/app/run record entirely (and cascade-delete its memories)."
-    )
-    def delete_entities(
-        user_id: Annotated[
-            Optional[str], Field(default=None, description="Delete this user and its memories.")
-        ] = None,
-        agent_id: Annotated[
-            Optional[str], Field(default=None, description="Delete this agent and its memories.")
-        ] = None,
-        app_id: Annotated[
-            Optional[str], Field(default=None, description="Delete this app and its memories.")
-        ] = None,
-        run_id: Annotated[
-            Optional[str], Field(default=None, description="Delete this run and its memories.")
-        ] = None,
-        ctx: Context | None = None,
-    ) -> str:
-        """Delete a user/agent/app/run (and its memories) once the user confirms the scope."""
-
-        api_key, _, _ = _resolve_settings(ctx)
-        args = DeleteEntitiesArgs(
-            user_id=user_id,
-            agent_id=agent_id,
-            app_id=app_id,
-            run_id=run_id,
-        )
-        if not any([args.user_id, args.agent_id, args.app_id, args.run_id]):
-            return json.dumps(
-                {
-                    "error": "scope_missing",
-                    "detail": "Provide user_id, agent_id, app_id, or run_id before calling delete_entities.",
-                },
-                ensure_ascii=False,
-            )
-        payload = args.model_dump(exclude_none=True)
-        client = _mem0_client(api_key)
-        return _mem0_call(client.delete_users, **payload)
-
-    # Add a simple prompt for server capabilities
     @server.prompt()
     def memory_assistant() -> str:
-        """Get help with memory operations and best practices."""
-        return """You are using the Mem0 MCP server for long-term memory management.
+        """Get help with memory operations."""
+        return """You are using a local Mem0 MCP server for persistent memory.
 
 Quick Start:
 1. Store memories: Use add_memory to save facts, preferences, or conversations
 2. Search memories: Use search_memories for semantic queries
-3. List memories: Use get_memories for filtered browsing
+3. List memories: Use get_memories to browse by user/agent/run scope
 4. Update/Delete: Use update_memory and delete_memory for modifications
+5. History: Use memory_history to see changes to a specific memory
 
-Filter Examples:
-- User memories: {"AND": [{"user_id": "john"}]}
-- Agent memories: {"AND": [{"agent_id": "agent_name"}]}
-- Recent only: {"AND": [{"user_id": "john"}, {"created_at": {"gte": "2024-01-01"}}]}
-
-Tips:
-- user_id is automatically added to filters
-- Use "*" as wildcard for any non-null value
-- Combine filters with AND/OR/NOT for complex queries"""
+All memories are scoped by user_id (defaults to the configured default user).
+Data is stored locally — nothing leaves your machine."""
 
     return server
 
 
 def main() -> None:
     """Run the MCP server over stdio."""
-
     server = create_server()
-    logger.info("Starting Mem0 MCP server (default user=%s)", ENV_DEFAULT_USER_ID)
+    logger.info("Starting local Mem0 MCP server (default user=%s)", ENV_DEFAULT_USER_ID)
     server.run(transport="stdio")
 
 
