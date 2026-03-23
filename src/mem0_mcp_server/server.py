@@ -7,6 +7,7 @@ import logging
 import os
 from typing import Annotated, Any, Dict, Optional
 
+import requests
 from dotenv import load_dotenv
 from mcp.server.fastmcp import Context, FastMCP
 from mem0 import Memory
@@ -51,6 +52,25 @@ _KNOWN_DIMS = {
 }
 
 
+def _get_loaded_model() -> str:
+    """Query the LLM server for the first loaded model."""
+    base_url = os.getenv("MEM0_LLM_BASE_URL", "http://localhost:8080/v1")
+    try:
+        resp = requests.get(f"{base_url}/models", timeout=5)
+        resp.raise_for_status()
+        for model in resp.json().get("data", []):
+            status = model.get("status", {})
+            if isinstance(status, dict) and status.get("value") == "loaded":
+                logger.info("Auto-detected loaded model: %s", model["id"])
+                return model["id"]
+            elif isinstance(status, str) and status == "loaded":
+                logger.info("Auto-detected loaded model: %s", model["id"])
+                return model["id"]
+    except Exception as exc:
+        logger.warning("Could not auto-detect model: %s", exc)
+    return os.getenv("MEM0_LLM_MODEL", "local-model")
+
+
 def _build_config() -> dict:
     """Build mem0 Memory config from environment variables."""
     embedder_model = os.getenv("MEM0_EMBEDDER_MODEL", "multi-qa-MiniLM-L6-cos-v1")
@@ -58,11 +78,13 @@ def _build_config() -> dict:
         os.getenv("MEM0_EMBEDDING_DIMS", str(_KNOWN_DIMS.get(embedder_model, 384)))
     )
 
+    model_name = os.getenv("MEM0_LLM_MODEL") or _get_loaded_model()
+
     config: dict[str, Any] = {
         "llm": {
             "provider": os.getenv("MEM0_LLM_PROVIDER", "openai"),
             "config": {
-                "model": os.getenv("MEM0_LLM_MODEL", "local-model"),
+                "model": model_name,
                 "openai_base_url": os.getenv("MEM0_LLM_BASE_URL", "http://localhost:8080/v1"),
                 "api_key": os.getenv("MEM0_LLM_API_KEY", "not-needed"),
                 "temperature": float(os.getenv("MEM0_LLM_TEMPERATURE", "0.1")),
