@@ -33,6 +33,7 @@ except ImportError:
 load_dotenv()
 
 os.environ["MEM0_TELEMETRY"] = os.getenv("MEM0_TELEMETRY", "false")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s | %(message)s")
 logger = logging.getLogger("mem0_mcp_server")
